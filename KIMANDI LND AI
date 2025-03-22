@@ -1,0 +1,191 @@
+package main
+
+import (
+    "bytes"
+    "compress/gzip"
+    "context"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "os/exec"
+    "runtime"
+    "strings"
+    "sync"
+    "time"
+
+    "github.com/dgrijalva/jwt-go"
+    "github.com/sirupsen/logrus"
+    "golang.org/x/time/rate"
+)
+
+// ... (Keep your existing structs: ListRankChange, rankItem, baseNode, graphMetrics, graphInfo, Node, NodeRankings, Config)
+
+// Agent manages fetching and storing rankings
+type Agent struct {
+    config     Config
+    logger     *logrus.Logger
+    rankings   NodeRankings
+    mutex      sync.Mutex
+    client     *http.Client
+    limiter    *rate.Limiter
+    stopChan   chan struct{}
+}
+
+// NewAgent initializes an Agent with the given config
+func NewAgent(config Config) (*Agent, error) {
+    if config.AmbossAPIKey == "" {
+        return nil, fmt.Errorf("AmbossAPIKey is required")
+    }
+    if config.RequestsPerSec <= 0 {
+        config.RequestsPerSec = 100
+    }
+    if config.BurstLimit <= 0 {
+        config.BurstLimit = 10
+    }
+    if config.MaxRetries < 0 {
+        config.MaxRetries = 0
+    }
+    if config.RetryDelay <= 0 {
+        config.RetryDelay = time.Second
+    }
+
+    logger := logrus.New()
+    logger.SetLevel(logrus.InfoLevel)
+
+    agent := &Agent{
+        config:   config,
+        logger:   logger,
+        client:   &http.Client{Timeout: 10 * time.Second},
+        limiter:  rate.NewLimiter(rate.Limit(config.RequestsPerSec), config.BurstLimit),
+        stopChan: make(chan struct{}),
+    }
+
+    return agent, nil
+}
+
+// checkAPIKeyExpiration decodes the JWT and returns its expiration time
+func (a *Agent) checkAPIKeyExpiration() (time.Time, error) {
+    token, _, err := new(jwt.Parser).ParseUnverified(a.config.AmbossAPIKey, jwt.MapClaims{})
+    if err != nil {
+        return time.Time{}, fmt.Errorf("failed to parse API key: %v", err)
+    }
+    claims, ok := token.Claims.(jwt.MapClaims)
+    if !ok {
+        return time.Time{}, fmt.Errorf("invalid claims format")
+    }
+    exp, ok := claims["exp"].(float64)
+    if !ok {
+        return time.Time{}, fmt.Errorf("expiration not found or invalid")
+    }
+    return time.Unix(int64(exp), 0), nil
+}
+
+// monitorAPIKey runs in a goroutine to check the API key expiration periodically
+func (a *Agent) monitorAPIKey(notifyInterval time.Duration) {
+    ticker := time.NewTicker(24 * time.Hour)
+    defer ticker.Stop()
+
+    renewalInstructions := `Your API key expires soon! Renew it manually:
+1. Visit https://amboss.space and log in.
+2. Go to Account Panel > API Keys.
+3. Click "Create New Key".
+4. Update 'AmbossAPIKey' in your Config and restart the app.
+For help, contact Amboss via Telegram/Twitter.
+KIMANDI LND
+FEEL FREE TO DONATE @ bc1q6tep0u9gp408spl0s6qdlswpu793mn7fmkdy6m`
+
+    hasNotified := false
+    today := time.Date(2025, time.March, 22, 0, 0, 0, 0, time.UTC) // Define today's date
+
+    for {
+        select {
+        case <-ticker.C:
+            expTime, err := a.checkAPIKeyExpiration()
+            if err != nil {
+                a.logger.Errorf("Failed to check API key expiration: %v", err)
+                continue
+            }
+            daysUntilExpiry := int(time.Until(expTime).Hours() / 24)
+            renewalThreshold := 30
+
+            a.logger.WithFields(logrus.Fields{
+                "expires_at":       expTime.Format(time.RFC3339),
+                "days_until_expiry": daysUntilExpiry,
+            }).Debug("API key expiration check")
+
+            // Skip notification if expiration is today (March 22, 2025)
+            if expTime.Year() == today.Year() && expTime.Month() == today.Month() && expTime.Day() == today.Day() {
+                a.logger.Infof("API key expires today (%s), skipping notification", expTime.Format(time.RFC3339))
+                continue
+            }
+
+            if daysUntilExpiry <= renewalThreshold && !hasNotified {
+                a.logger.Warnf("API key expires in %d days (on %s). Displaying renewal instructions.", daysUntilExpiry, expTime.Format(time.RFC3339))
+                cmd := exec.Command("zenity", "--warning", "--text", fmt.Sprintf("API key expires in %d days (on %s):\n%s", daysUntilExpiry, expTime.Format(time.RFC3339), renewalInstructions), "--title", "API Key Expiration Warning")
+                if err := cmd.Run(); err != nil {
+                    a.logger.Errorf("Failed to display pop-up: %v (ensure zenity is installed)", err)
+                    fmt.Printf("WARNING: API key expires in %d days (on %s):\n%s\n", daysUntilExpiry, expTime.Format(time.RFC3339), renewalInstructions)
+                }
+                hasNotified = true
+            } else if daysUntilExpiry > renewalThreshold {
+                a.logger.Infof("API key still valid for %d days (expires %s)", daysUntilExpiry, expTime.Format(time.RFC3339))
+                hasNotified = false
+            }
+
+        case <-a.stopChan:
+            a.logger.Info("Stopping API key monitoring")
+            return
+        }
+    }
+}
+
+// StartMonitoring begins the API key expiration monitoring
+func (a *Agent) StartMonitoring() {
+    go a.monitorAPIKey(24 * time.Hour)
+}
+
+// StopMonitoring stops the API key expiration monitoring
+func (a *Agent) StopMonitoring() {
+    close(a.stopChan)
+}
+
+// ... (Keep your existing compressBody, fetchBatch, FetchRankings, and GetRankings functions)
+
+func main() {
+    logger := logrus.New()
+    logger.SetLevel(logrus.InfoLevel)
+
+    agent, err := NewAgent(Config{
+        AmbossAPIKey:   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2ZXJzaW9uIjowLjEsImlhdCI6MTc0MjYyOTA0NSwiZXhwIjoxNzc0MTY1MDQ1LCJpc3MiOiJhcGkuYW1ib3NzLnNwYWNlIiwic3ViIjoiNGE5MzNhN2YtYzE3NS00MmEwLTk1YzEtNzBlMTBmM2I5OGZhIn0.3lxbHSHuNBVSBIwxAmdnRdluwuIzn0nb5tTKyONavEU",
+        MaxRetries:     5,
+        RetryDelay:     time.Second,
+        RequestsPerSec: 5,
+        BurstLimit:     10,
+    })
+    if err != nil {
+        logger.Fatalf("Failed to initialize agent: %v", err)
+    }
+    agent.logger = logger
+
+    // Start API key monitoring
+    agent.StartMonitoring()
+    defer agent.StopMonitoring()
+
+    fmt.Println("Starting the application...")
+    start := time.Now()
+    err = agent.FetchRankings()
+    if err != nil {
+        logger.Fatalf("Error fetching rankings: %v", err)
+    }
+    fmt.Printf("Took %s\n", time.Since(start))
+
+    rankings := agent.GetRankings()
+    fmt.Printf("Fetched %d nodes\n", len(rankings.GetNodes()))
+    for i, node := range rankings.GetNodes() {
+        fmt.Printf("Node %d: Pubkey: %s, Alias: %s, Capacity: %d, Channels: %d, Rank: %d, RankChange: {Day:%d Week:%d Month:%d}\n",
+            i, node.GetPubkey(), node.GetAlias(), node.GetCapacity(), node.GetChannelCount(),
+            node.GetRank(), node.GetRankChange().GetDay(), node.GetRankChange().GetWeek(), node.GetRankChange().GetMonth())
+    }
+    fmt.Printf("Last Updated: %s\n", rankings.GetLastUpdated())
+}
